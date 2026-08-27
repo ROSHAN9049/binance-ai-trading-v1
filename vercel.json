@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/square-auto-post",
+      "schedule": "30 9 * * *"
+    }
+  ]
+}
