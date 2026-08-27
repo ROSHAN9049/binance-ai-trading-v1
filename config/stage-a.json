@@ -1,0 +1,16 @@
+{
+  "stage": "A",
+  "mode": "paper",
+  "virtualCapitalINR": 2000,
+  "markets": ["BTCUSDT", "ETHUSDT"],
+  "riskPerTradePercent": 1,
+  "maxTradesPerDay": 3,
+  "maxConsecutiveLosses": 3,
+  "futures": false,
+  "leverage": 1,
+  "simulateFees": true,
+  "simulateSlippage": true,
+  "targetCompletedTrades": 100,
+  "liveOrdersEnabled": false,
+  "binanceCredentialsRequired": false
+}
