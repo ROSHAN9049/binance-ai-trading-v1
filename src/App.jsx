@@ -1,25 +1,42 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 
-const API='https://api.india.delta.exchange/v2/tickers';
-const WS='wss://socket.india.delta.exchange';
+const API='https://api.india.delta.exchange/v2';
+const WS='wss://public-socket.india.delta.exchange';
+const TELEGRAM_COOLDOWN=15*60*1000;
 
 function App(){
- const [tickers,setTickers]=useState([]); const [status,setStatus]=useState('Connecting…'); const [last,setLast]=useState(null);
- useEffect(()=>{let ws; let alive=true;
-  fetch(API).then(r=>r.json()).then(d=>{if(alive&&d.result){setTickers(d.result);setLast(new Date())}}).catch(()=>setStatus('API error'));
-  try{ws=new WebSocket(WS); ws.onopen=()=>{setStatus('LIVE');ws.send(JSON.stringify({type:'subscribe',payload:{channels:[{name:'v2/ticker',symbols:['all']} ]}}))}; ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d?.type?.includes('ticker')&&d.symbol){setTickers(x=>{const m=new Map(x.map(a=>[a.symbol,a]));m.set(d.symbol,{...m.get(d.symbol),...d});return [...m.values()]});setLast(new Date())}}catch{}};ws.onerror=()=>setStatus('Polling');}catch{setStatus('Polling')}
-  const poll=setInterval(()=>fetch(API).then(r=>r.json()).then(d=>{if(d.result){setTickers(d.result);setLast(new Date());setStatus('LIVE')}}).catch(()=>{}),5000);
-  return()=>{alive=false;clearInterval(poll);ws?.close()}
+ const [tickers,setTickers]=useState([]); const [status,setStatus]=useState('CONNECTING'); const [last,setLast]=useState(null);
+ const [candleMap,setCandleMap]=useState({}); const history=useRef({}); const alertState=useRef({});
+ const [telegram,setTelegram]=useState(()=>localStorage.getItem('deltaTelegram')==='1');
+ const [threshold,setThreshold]=useState(70);
+
+ const loadTickers=async()=>{try{const r=await fetch(`${API}/tickers?contract_types=perpetual_futures`);const d=await r.json();if(d.result){setTickers(d.result);setLast(new Date());setStatus('LIVE')}}catch{setStatus('POLLING')}};
+ useEffect(()=>{let ws; let alive=true; loadTickers(); const poll=setInterval(loadTickers,5000);
+  try{ws=new WebSocket(WS);ws.onopen=()=>{setStatus('LIVE');ws.send(JSON.stringify({type:'subscribe',payload:{channels:[{name:'ticker',symbols:['perpetual_futures']},{name:'candlestick_5m',symbols:['perpetual_futures']},{name:'candlestick_15m',symbols:['perpetual_futures']}]}}))};
+   ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.type==='ticker'&&d.sy){setTickers(x=>{const m=new Map(x.map(a=>[a.symbol,a]));const old=m.get(d.sy)||{};m.set(d.sy,{...old,symbol:d.sy,close:d.c??old.close,ltp_change_24h:d.ltp_change_24h??old.ltp_change_24h,turnover_usd:d.turnover_usd??old.turnover_usd});return [...m.values()]});setLast(new Date())}
+    if((d.type==='candlestick_5m'||d.type==='candlestick_15m')&&d.sy){const res=d.type.includes('15m')?'15m':'5m';setCandleMap(x=>({...x,[`${res}:${d.sy`]:{open:Number(d.o),close:Number(d.c),high:Number(d.h),low:Number(d.l),volume:Number(d.v||0),ts:d.ts}}));const k=`${res}:${d.sy}`;const arr=history.current[k]||[];const next=[...arr,{open:Number(d.o),close:Number(d.c),high:Number(d.h),low:Number(d.l),volume:Number(d.v||0),ts:d.ts}].slice(-25);history.current[k]=next;}
+   }catch{}};ws.onerror=()=>setStatus('POLLING');ws.onclose=()=>alive&&setStatus('RECONNECTING')}catch{setStatus('POLLING')}
+  return()=>{alive=false;clearInterval(poll);ws?.close()};
  },[]);
- const rows=useMemo(()=>tickers.filter(x=>x.symbol && x.contract_type==='perpetual_futures' || x.symbol).map(x=>{const ch=Number(x.price_change_percent_24h??x.price_change_percent??0);const vol=Number(x.turnover_usd_24h??x.volume_24h??0);const score=Math.min(100,Math.round(Math.abs(ch)*12+Math.log10(Math.max(vol,1))*4));const signal=ch>=2&&score>=65?'PUMP':ch<=-2&&score>=65?'DUMP':score>=45?'WATCH':'—';return {...x,ch,vol,score,signal}}).sort((a,b)=>b.score-a.score),[tickers]);
- const pump=rows.filter(r=>r.signal==='PUMP').slice(0,5), dump=rows.filter(r=>r.signal==='DUMP').slice(0,5);
- return <div className="app"><header><div><h1>⚡ Delta Scanner</h1><p>Delta Exchange India · Live Momentum Scanner</p></div><div className="live"><span className="dot"/> {status}</div></header>
- <section className="cards"><Card title="Top Pump" data={pump}/><Card title="Top Dump" data={dump}/><div className="card"><b>Scanner Engine</b><strong>5s</strong><small>Live refresh · 24H volume + momentum</small><div className="telegram">🔔 Telegram alerts: Ready</div></div></section>
- <section className="panel"><div className="panelhead"><h2>Market Scanner</h2><span>{rows.length} instruments · {last?last.toLocaleTimeString():''}</span></div><div className="tablewrap"><table><thead><tr><th>Symbol</th><th>24H Change</th><th>24H Volume</th><th>Signal Strength</th><th>Signal</th></tr></thead><tbody>{rows.slice(0,100).map(r=><tr key={r.symbol}><td><b>{r.symbol}</b></td><td className={r.ch>=0?'up':'down'}>{r.ch.toFixed(2)}%</td><td>${fmt(r.vol)}</td><td><div className="bar"><i style={{width:`${r.score}%`}}/></div><b>{r.score}/100</b></td><td><span className={`badge ${r.signal.toLowerCase()}`}>{r.signal}</span></td></tr>)}</tbody></table></div></section>
- <footer>⚠️ Signals are informational. No real orders are placed by this scanner.</footer></div>
+
+ const rows=useMemo(()=>tickers.filter(x=>x.symbol&&x.contract_type==='perpetual_futures').map(x=>{const ch=Number(x.ltp_change_24h??0);const vol=Number(x.turnover_usd??0);const c5=candleMap[`5m:${x.symbol}`];const c15=candleMap[`15m:${x.symbol}`];
+   const trend5=c5?(c5.close>c5.open?'BULL':c5.close<c5.open?'BEAR':'FLAT'):'WAIT'; const trend15=c15?(c15.close>c15.open?'BULL':c15.close<c15.open?'BEAR':'FLAT'):'WAIT';
+   const h5=history.current[`5m:${x.symbol}`]||[];const prev=h5.slice(0,-1).map(a=>a.volume).filter(v=>v>0);const avg=prev.length?prev.reduce((a,b)=>a+b,0)/prev.length:0;const spike=avg>0?Number((Number(c5?.volume||0)/avg).toFixed(1)):0;
+   const momentum=Math.min(30,Math.round(Math.abs(ch)*5));const volumeScore=Math.min(30,Math.round(Math.max(0,spike-1)*10));const t5=trend5==='BULL'&&ch>0||trend5==='BEAR'&&ch<0?20:trend5==='FLAT'?8:0;const t15=trend15==='BULL'&&ch>0||trend15==='BEAR'&&ch<0?20:trend15==='FLAT'?8:0;const score=Math.min(100,momentum+volumeScore+t5+t15);
+   const direction=ch>=0?'LONG':'SHORT';const confirmed=direction==='LONG'?trend5==='BULL'&&trend15==='BULL':trend5==='BEAR'&&trend15==='BEAR';const signal=score>=threshold&&confirmed?(direction==='LONG'?'PUMP':'DUMP'):score>=50?'WATCH':'—';return {...x,ch,vol,spike,trend5,trend15,score,signal,confirmed};
+  }).sort((a,b)=>b.score-a.score),[tickers,candleMap,threshold]);
+ const pump=rows.filter(r=>r.signal==='PUMP').slice(0,5),dump=rows.filter(r=>r.signal==='DUMP').slice(0,5);const spikes=rows.filter(r=>r.spike>=2).sort((a,b)=>b.spike-a.spike).slice(0,5);
+ useEffect(()=>{if(!telegram)return;rows.filter(r=>r.signal==='PUMP'||r.signal==='DUMP').slice(0,10).forEach(r=>{const key=r.symbol+':'+r.signal;const now=Date.now();if(now-(alertState.current[key]||0)<TELEGRAM_COOLDOWN)return;alertState.current[key]=now;fetch('/api/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:r.symbol,signal:r.signal,score:r.score,change:r.ch,volumeSpike:r.spike,trend5:r.trend5,trend15:r.trend15})}).catch(()=>{})})},[rows,telegram]);
+ const toggleTelegram=()=>{const n=!telegram;setTelegram(n);localStorage.setItem('deltaTelegram',n?'1':'0')};
+ return <div className="app"><header><div><div className="brand">⚡ Delta Scanner</div><div className="sub">Delta Exchange India · Live Momentum + Volume Scanner</div></div><div className="live"><span/> {status}</div></header>
+  <section className="hero"><div><h1>Market Radar</h1><p>24H momentum + volume spike + 5m/15m trend confirmation. Signals stay informational; no real orders are placed.</p></div><button onClick={toggleTelegram}>🔔 Telegram {telegram?'ON':'OFF'}</button></section>
+  <section className="cards"><Card title="Top Pump" data={pump}/><Card title="Top Dump" data={dump}/><Card title="Volume Spike" data={spikes} spike/><div className="card"><small>MIN SIGNAL SCORE</small><strong>{threshold}/100</strong><input className="range" type="range" min="50" max="90" value={threshold} onChange={e=>setThreshold(Number(e.target.value))}/><small>5m + 15m confirmation required</small></div></section>
+  <section className="panel"><div className="panelhead"><h2>Market Scanner</h2><span>{rows.length} perpetuals · {last?last.toLocaleTimeString():''}</span></div><div className="tablewrap"><table><thead><tr><th>Symbol</th><th>24H Change</th><th>Volume</th><th>Spike</th><th>5m</th><th>15m</th><th>Strength</th><th>Signal</th></tr></thead><tbody>{rows.slice(0,100).map(r=><tr key={r.symbol}><td><b>{r.symbol}</b></td><td className={r.ch>=0?'up':'down'}>{r.ch.toFixed(2)}%</td><td>${fmt(r.vol)}</td><td className={r.spike>=2?'hot':''}>{r.spike?r.spike+'x':'—'}</td><td><span className={'trend '+r.trend5.toLowerCase()}>{r.trend5}</span></td><td><span className={'trend '+r.trend15.toLowerCase()}>{r.trend15}</span></td><td><div className="score"><i style={{width:`${r.score}%`}}/><span>{r.score}</span></div></td><td><span className={`pill ${r.signal==='PUMP'?'buy':r.signal==='DUMP'?'sell':'watch'}`}>{r.signal}</span></td></tr>)}</tbody></table></div></section>
+  <footer>⚠️ Informational scanner only. Telegram alerts require Vercel environment variables. Automatic trading remains OFF.</footer></div>
 }
-function Card({title,data}){return <div className="card"><b>{title}</b>{data.length?<ol>{data.map(x=><li key={x.symbol}><span>{x.symbol}</span><strong className={x.ch>=0?'up':'down'}>{x.ch.toFixed(2)}%</strong></li>)}</ol>:<small>No qualifying signal yet</small>}</div>}
-function fmt(n){if(n>=1e9)return (n/1e9).toFixed(1)+'B';if(n>=1e6)return (n/1e6).toFixed(1)+'M';if(n>=1e3)return (n/1e3).toFixed(1)+'K';return n.toFixed(0)}
+function Card({title,data,spike}){return <div className="card"><small>{title.toUpperCase()}</small>{data.length?<ol>{data.map(x=><li key={x.symbol}><span>{x.symbol}</span><strong className={spike?'hot':x.ch>=0?'up':'down'}>{spike?x.spike+'x':x.ch.toFixed(2)+'%'}</strong></li>)}</ol>:<small>No qualifying signal yet</small>}</div>}
+function fmt(n){if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return n.toFixed(0)}
+
 createRoot(document.getElementById('root')).render(<App/>);
